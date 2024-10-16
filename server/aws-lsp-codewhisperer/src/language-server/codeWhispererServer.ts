@@ -12,6 +12,7 @@ import {
     Server,
     Telemetry,
     TextDocument,
+    ExecuteCommandParams,
 } from '@aws/language-server-runtimes/server-interface'
 import { AWSError } from 'aws-sdk'
 import { autoTrigger, triggerType } from './auto-trigger/autoTrigger'
@@ -287,7 +288,11 @@ export const CodewhispererServerFactory =
             })
 
             return {
-                capabilities: {},
+                capabilities: {
+                    executeCommandProvider: {
+                        commands: ['inline-prompt'],
+                    },
+                },
             }
         })
 
@@ -301,7 +306,8 @@ export const CodewhispererServerFactory =
 
         const onInlineCompletionHandler = async (
             params: InlineCompletionWithReferencesParams,
-            _token: CancellationToken
+            _token: CancellationToken,
+            prompt?: string
         ): Promise<InlineCompletionListWithReferences> => {
             // On every new completion request close current inflight session.
             const currentSession = sessionManager.getCurrentSession()
@@ -379,14 +385,28 @@ export const CodewhispererServerFactory =
 
                 codePercentageTracker.countInvocation(inferredLanguageId)
 
+                // Create leftFileContent for current file
+                let leftFileContent = requestContext.fileContext.leftFileContent
+                    .slice(-CONTEXT_CHARACTERS_LIMIT)
+                    .replaceAll('\r\n', '\n')
+
+                // If a prompt is provided as an explicit parameter, insert it into the
+                // document in the last line above the current document
+                if (prompt) {
+                    const lastNewLine = leftFileContent.lastIndexOf('\n')
+                    leftFileContent =
+                        leftFileContent.substring(0, lastNewLine) +
+                        '\n' +
+                        prompt +
+                        leftFileContent.substring(lastNewLine)
+                }
+
                 return codeWhispererService
                     .generateSuggestions({
                         ...requestContext,
                         fileContext: {
                             ...requestContext.fileContext,
-                            leftFileContent: requestContext.fileContext.leftFileContent
-                                .slice(-CONTEXT_CHARACTERS_LIMIT)
-                                .replaceAll('\r\n', '\n'),
+                            leftFileContent: leftFileContent,
                             rightFileContent: requestContext.fileContext.rightFileContent
                                 .slice(0, CONTEXT_CHARACTERS_LIMIT)
                                 .replaceAll('\r\n', '\n'),
@@ -547,10 +567,23 @@ export const CodewhispererServerFactory =
                 })
                 .catch(reason => logging.log(`Error in GetConfiguration: ${reason}`))
 
+        const onExecuteCommandHandler = async (
+            params: ExecuteCommandParams,
+            _token: CancellationToken
+        ): Promise<any> => {
+            switch (params.command) {
+                case 'inline-prompt':
+                    if (!params.arguments) return
+                    onInlineCompletionHandler(params.arguments[0], _token, params.arguments[0].prompt)
+                    return
+            }
+        }
+
         lsp.extensions.onInlineCompletionWithReferences(onInlineCompletionHandler)
         lsp.extensions.onLogInlineCompletionSessionResults(onLogInlineCompletionSessionResultsHandler)
         lsp.onInitialized(updateConfiguration)
         lsp.didChangeConfiguration(updateConfiguration)
+        lsp.onExecuteCommand(onExecuteCommandHandler)
 
         lsp.onDidChangeTextDocument(async p => {
             const textDocument = await workspace.getTextDocument(p.textDocument.uri)
